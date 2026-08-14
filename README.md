@@ -6,7 +6,7 @@ Extract heading-based outline trees from Markdown files.
 ext note.md                 # tree output by default
 ext notes/ --format=outline
 ext notes/ --format=json --output=headings.json
-ext notes/ --style=always   # force ANSI-styled boxed tree output
+ext notes/ --style=always   # force Catppuccin ANSI-styled boxed tree output
 ext notes/ --style=never    # plain tree output
 ```
 

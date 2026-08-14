@@ -514,7 +514,7 @@ fn styled_block(record: &FileRecord) -> StyledBlock {
     let max_content_width = content
         .iter()
         .map(|(plain, _)| display_width(plain))
-        .chain([display_width(&format!(" {name} "))])
+        .chain([display_width(&file_label_plain(&name))])
         .max()
         .unwrap_or(0);
     let width = (max_content_width + 2).max(min_width);
@@ -544,8 +544,8 @@ fn styled_tree_content(
         let plain = format!("{prefix}{branch} {}", node.text);
         let styled = format!(
             "{}{} {}",
-            paint(prefix, Color::DarkGray),
-            paint(branch, Color::DarkGray),
+            paint(prefix, cat_surface2()),
+            paint(branch, cat_surface2()),
             paint(&node.text, level_color)
         );
 
@@ -555,52 +555,92 @@ fn styled_tree_content(
 
     if root && nodes.is_empty() {
         let plain = "  ∅ no headings".to_string();
-        let styled = paint(&plain, Color::DarkGray);
+        let styled = paint(&plain, cat_subtext0());
         lines.push((plain, styled));
     }
 }
 
 fn styled_block_top(name: &str, inner_width: usize) -> String {
-    let label = format!(" {name} ");
+    let label = file_label_plain(name);
     let filler = "─".repeat(inner_width.saturating_sub(display_width(&label)));
     format!(
         "{}{}{}{}",
-        paint("╭", Color::DarkGray),
-        paint(&label, Color::Yellow),
-        paint(&filler, Color::DarkGray),
-        paint("╮", Color::DarkGray)
+        paint("╭", cat_surface2()),
+        styled_file_label(name),
+        paint(&filler, cat_surface2()),
+        paint("╮", cat_surface2())
     )
+}
+
+fn file_label_plain(name: &str) -> String {
+    format!(" {} ", name.to_uppercase())
+}
+
+fn styled_file_label(name: &str) -> String {
+    format!(" {} ", bold(&paint(&name.to_uppercase(), cat_rosewater())))
 }
 
 fn styled_block_line(plain: &str, styled: &str, inner_width: usize) -> String {
     let padding = " ".repeat(inner_width.saturating_sub(display_width(plain)));
     format!(
         "{}{}{}{}",
-        paint("│", Color::DarkGray),
+        paint("│", cat_surface2()),
         styled,
         padding,
-        paint("│", Color::DarkGray)
+        paint("│", cat_surface2())
     )
 }
 
 fn styled_block_bottom(inner_width: usize) -> String {
     format!(
         "{}{}{}",
-        paint("╰", Color::DarkGray),
-        paint(&"─".repeat(inner_width), Color::DarkGray),
-        paint("╯", Color::DarkGray)
+        paint("╰", cat_surface2()),
+        paint(&"─".repeat(inner_width), cat_surface2()),
+        paint("╯", cat_surface2())
     )
 }
 
 fn color_for_level(level: u8) -> Color {
     match level {
-        1 => Color::Magenta,
-        2 => Color::Cyan,
-        3 => Color::Green,
-        4 => Color::Yellow,
-        5 => Color::LightBlue,
-        _ => Color::Gray,
+        1 => cat_mauve(),
+        2 => cat_blue(),
+        3 => cat_green(),
+        4 => cat_peach(),
+        5 => cat_yellow(),
+        _ => cat_subtext0(),
     }
+}
+
+fn cat_rosewater() -> Color {
+    Color::Rgb(245, 224, 220)
+}
+
+fn cat_mauve() -> Color {
+    Color::Rgb(203, 166, 247)
+}
+
+fn cat_blue() -> Color {
+    Color::Rgb(137, 180, 250)
+}
+
+fn cat_green() -> Color {
+    Color::Rgb(166, 227, 161)
+}
+
+fn cat_peach() -> Color {
+    Color::Rgb(250, 179, 135)
+}
+
+fn cat_yellow() -> Color {
+    Color::Rgb(249, 226, 175)
+}
+
+fn cat_subtext0() -> Color {
+    Color::Rgb(166, 173, 200)
+}
+
+fn cat_surface2() -> Color {
+    Color::Rgb(88, 91, 112)
 }
 
 fn terminal_width() -> Option<u16> {
@@ -636,24 +676,35 @@ fn should_style(style: StyleMode, writing_to_file: bool) -> bool {
     }
 }
 
+fn bold(text: &str) -> String {
+    format!("\x1b[1m{text}\x1b[22m")
+}
+
 fn paint(text: &str, color: Color) -> String {
-    let code = match color {
-        Color::Black => 30,
-        Color::Red => 31,
-        Color::Green => 32,
-        Color::Yellow => 33,
-        Color::Blue => 34,
-        Color::Magenta => 35,
-        Color::Cyan => 36,
-        Color::Gray | Color::White => 37,
-        Color::DarkGray => 90,
-        Color::LightRed => 91,
-        Color::LightGreen => 92,
-        Color::LightYellow => 93,
-        Color::LightBlue => 94,
-        Color::LightMagenta => 95,
-        Color::LightCyan => 96,
-        Color::Rgb(_, _, _) | Color::Indexed(_) | Color::Reset => 39,
-    };
-    format!("\x1b[{code}m{text}\x1b[0m")
+    match color {
+        Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[0m"),
+        Color::Indexed(index) => format!("\x1b[38;5;{index}m{text}\x1b[0m"),
+        Color::Reset => text.to_string(),
+        _ => {
+            let code = match color {
+                Color::Black => 30,
+                Color::Red => 31,
+                Color::Green => 32,
+                Color::Yellow => 33,
+                Color::Blue => 34,
+                Color::Magenta => 35,
+                Color::Cyan => 36,
+                Color::Gray | Color::White => 37,
+                Color::DarkGray => 90,
+                Color::LightRed => 91,
+                Color::LightGreen => 92,
+                Color::LightYellow => 93,
+                Color::LightBlue => 94,
+                Color::LightMagenta => 95,
+                Color::LightCyan => 96,
+                Color::Rgb(_, _, _) | Color::Indexed(_) | Color::Reset => unreachable!(),
+            };
+            format!("\x1b[{code}m{text}\x1b[0m")
+        }
+    }
 }
