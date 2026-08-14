@@ -445,6 +445,7 @@ fn run_tui(records: &[FileRecord]) -> Result<(), String> {
     let mut selected = 0usize;
     let mut scroll: u16 = 0;
     let mut positions = Vec::new();
+    let mut search = SearchState::default();
     let mut result = Ok(());
 
     loop {
@@ -459,7 +460,19 @@ fn run_tui(records: &[FileRecord]) -> Result<(), String> {
             positions = layout_tui_cards(&cards, body, scroll);
 
             if let Some(position) = positions.iter().find(|position| position.index == selected) {
-                if position.full_y < scroll {
+                if let Some(match_y) = search.current_match_y(&cards, selected) {
+                    let target_y = position.full_y.saturating_add(match_y);
+                    if target_y < scroll {
+                        scroll = target_y;
+                        positions = layout_tui_cards(&cards, body, scroll);
+                    } else {
+                        let visible_bottom = scroll.saturating_add(body.height);
+                        if target_y >= visible_bottom {
+                            scroll = target_y.saturating_sub(body.height.saturating_sub(1));
+                            positions = layout_tui_cards(&cards, body, scroll);
+                        }
+                    }
+                } else if position.full_y < scroll {
                     scroll = position.full_y;
                     positions = layout_tui_cards(&cards, body, scroll);
                 } else {
@@ -486,32 +499,30 @@ fn run_tui(records: &[FileRecord]) -> Result<(), String> {
                 let title_style = Style::default()
                     .fg(cat_rosewater())
                     .add_modifier(Modifier::BOLD);
+                let query = search.active_query();
+                let mut match_index = query
+                    .map(|query| count_matches_before(&cards, position.index, query))
+                    .unwrap_or(0);
+                let title = highlighted_title(
+                    &card.title,
+                    title_style,
+                    query,
+                    search.current_match(),
+                    &mut match_index,
+                );
+                let lines =
+                    highlighted_lines(&card.lines, query, search.current_match(), &mut match_index);
                 let block = Block::default()
-                    .title(Span::styled(format!(" {} ", card.title), title_style))
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(border));
-                let paragraph = Paragraph::new(card.lines.clone()).block(block);
+                let paragraph = Paragraph::new(lines)
+                    .block(block)
+                    .scroll((position.clipped_top, 0));
                 frame.render_widget(paragraph, position.rect);
             }
 
-            let footer = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " NORMAL ",
-                    Style::default()
-                        .fg(cat_mauve())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" h/j/k/l cards  "),
-                Span::styled(" PgUp/PgDn ", Style::default().fg(cat_mauve())),
-                Span::raw("scroll  "),
-                Span::styled(" q ", Style::default().fg(cat_mauve())),
-                Span::raw("quit  "),
-                Span::styled(
-                    " --tree --json --outline ",
-                    Style::default().fg(cat_subtext0()),
-                ),
-                Span::raw("CLI"),
-            ]));
+            let footer = Paragraph::new(search.footer_line(&cards));
             frame.render_widget(footer, footer_area);
         });
 
@@ -524,25 +535,62 @@ fn run_tui(records: &[FileRecord]) -> Result<(), String> {
             .map_err(|err| format!("Failed to poll terminal events: {err}"))?
         {
             match event::read().map_err(|err| format!("Failed to read terminal event: {err}"))? {
-                TermEvent::Key(key) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('h') | KeyCode::Left => selected = selected.saturating_sub(1),
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        selected = (selected + 1).min(cards.len().saturating_sub(1));
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        selected = adjacent_card(selected, &positions, DirectionHint::Down)
-                            .unwrap_or_else(|| (selected + 1).min(cards.len().saturating_sub(1)));
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        selected = adjacent_card(selected, &positions, DirectionHint::Up)
-                            .unwrap_or_else(|| selected.saturating_sub(1));
-                    }
-                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
-                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-                    KeyCode::Home => selected = 0,
-                    KeyCode::End => selected = cards.len().saturating_sub(1),
-                    _ => {}
+                TermEvent::Key(key) => match search.mode {
+                    SearchMode::Input => match key.code {
+                        KeyCode::Enter => {
+                            if let Some(index) = search.commit(&cards, selected) {
+                                selected = index;
+                            }
+                        }
+                        KeyCode::Esc => search.cancel(),
+                        KeyCode::Backspace => search.backspace(),
+                        KeyCode::Char(ch) => search.push(ch),
+                        _ => {}
+                    },
+                    SearchMode::Normal => match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Esc => {
+                            if search.has_query() {
+                                search.clear();
+                            } else {
+                                break;
+                            }
+                        }
+                        KeyCode::Char('/') => search.start(),
+                        KeyCode::Char('n') => {
+                            if let Some(index) =
+                                search.navigate(&cards, selected, SearchDirection::Next)
+                            {
+                                selected = index;
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            if let Some(index) =
+                                search.navigate(&cards, selected, SearchDirection::Previous)
+                            {
+                                selected = index;
+                            }
+                        }
+                        KeyCode::Char('h') | KeyCode::Left => selected = selected.saturating_sub(1),
+                        KeyCode::Char('l') | KeyCode::Right => {
+                            selected = (selected + 1).min(cards.len().saturating_sub(1));
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            selected = adjacent_card(selected, &positions, DirectionHint::Down)
+                                .unwrap_or_else(|| {
+                                    (selected + 1).min(cards.len().saturating_sub(1))
+                                });
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            selected = adjacent_card(selected, &positions, DirectionHint::Up)
+                                .unwrap_or_else(|| selected.saturating_sub(1));
+                        }
+                        KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                        KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                        KeyCode::Home => selected = 0,
+                        KeyCode::End => selected = cards.len().saturating_sub(1),
+                        _ => {}
+                    },
                 },
                 TermEvent::Resize(_, _) => {}
                 _ => {}
@@ -573,6 +621,7 @@ struct TuiCardPosition {
     index: usize,
     rect: Rect,
     full_y: u16,
+    clipped_top: u16,
     visible: bool,
 }
 
@@ -580,6 +629,190 @@ struct TuiCardPosition {
 enum DirectionHint {
     Up,
     Down,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SearchMode {
+    Normal,
+    Input,
+}
+
+#[derive(Clone, Copy)]
+enum SearchDirection {
+    Next,
+    Previous,
+}
+
+#[derive(Clone, Copy)]
+struct SearchMatch {
+    card_index: usize,
+    line_y: u16,
+}
+
+struct SearchState {
+    mode: SearchMode,
+    query: String,
+    input: String,
+    cursor: Option<usize>,
+}
+
+impl Default for SearchState {
+    fn default() -> Self {
+        Self {
+            mode: SearchMode::Normal,
+            query: String::new(),
+            input: String::new(),
+            cursor: None,
+        }
+    }
+}
+
+impl SearchState {
+    fn start(&mut self) {
+        self.mode = SearchMode::Input;
+        self.input.clear();
+    }
+
+    fn commit(&mut self, cards: &[TuiCard], selected: usize) -> Option<usize> {
+        self.query = self.input.trim().to_string();
+        self.mode = SearchMode::Normal;
+        self.cursor = first_match_at_or_after_card(selected, cards, &self.query);
+        self.cursor.and_then(|cursor| {
+            search_matches(cards, &self.query)
+                .get(cursor)
+                .map(|search_match| search_match.card_index)
+        })
+    }
+
+    fn cancel(&mut self) {
+        self.input.clear();
+        self.mode = SearchMode::Normal;
+    }
+
+    fn clear(&mut self) {
+        self.query.clear();
+        self.input.clear();
+        self.cursor = None;
+        self.mode = SearchMode::Normal;
+    }
+
+    fn has_query(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    fn push(&mut self, ch: char) {
+        self.input.push(ch);
+    }
+
+    fn backspace(&mut self) {
+        self.input.pop();
+    }
+
+    fn active_query(&self) -> Option<&str> {
+        let text = match self.mode {
+            SearchMode::Normal => &self.query,
+            SearchMode::Input => &self.input,
+        };
+        let text = text.trim();
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn current_match(&self) -> Option<usize> {
+        (self.mode == SearchMode::Normal)
+            .then_some(self.cursor)
+            .flatten()
+    }
+
+    fn navigate(
+        &mut self,
+        cards: &[TuiCard],
+        selected: usize,
+        direction: SearchDirection,
+    ) -> Option<usize> {
+        let matches = search_matches(cards, &self.query);
+        if matches.is_empty() {
+            self.cursor = None;
+            return None;
+        }
+
+        let cursor = match self.cursor {
+            Some(cursor) if cursor < matches.len() => match direction {
+                SearchDirection::Next => (cursor + 1) % matches.len(),
+                SearchDirection::Previous => (cursor + matches.len() - 1) % matches.len(),
+            },
+            _ => first_match_at_or_after_card(selected, cards, &self.query).unwrap_or(0),
+        };
+        self.cursor = Some(cursor);
+        matches
+            .get(cursor)
+            .map(|search_match| search_match.card_index)
+    }
+
+    fn current_match_y(&self, cards: &[TuiCard], selected: usize) -> Option<u16> {
+        let cursor = self.current_match()?;
+        let search_match = *search_matches(cards, &self.query).get(cursor)?;
+        (search_match.card_index == selected).then_some(search_match.line_y)
+    }
+
+    fn footer_line(&self, cards: &[TuiCard]) -> Line<'static> {
+        match self.mode {
+            SearchMode::Input => {
+                let total = search_matches(cards, &self.input).len();
+                Line::from(vec![
+                    Span::styled(
+                        " NORMAL ",
+                        Style::default()
+                            .fg(cat_mauve())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" h/j/k/l cards  "),
+                    Span::styled(" / ", Style::default().fg(cat_mauve())),
+                    Span::styled(self.input.clone(), Style::default().fg(cat_yellow())),
+                    Span::styled(format!(" ({total})  "), Style::default().fg(cat_subtext0())),
+                    Span::styled(" Enter ", Style::default().fg(cat_mauve())),
+                    Span::raw("accept  "),
+                    Span::styled(" Esc ", Style::default().fg(cat_mauve())),
+                    Span::raw("cancel"),
+                ])
+            }
+            SearchMode::Normal => {
+                let mut spans = vec![
+                    Span::styled(
+                        " NORMAL ",
+                        Style::default()
+                            .fg(cat_mauve())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" h/j/k/l cards  "),
+                    Span::styled(" / ", Style::default().fg(cat_mauve())),
+                    Span::raw("search"),
+                ];
+                if !self.query.is_empty() {
+                    let total = search_matches(cards, &self.query).len();
+                    let current = self.cursor.map(|cursor| cursor + 1).unwrap_or(0).min(total);
+                    spans.push(Span::styled(" /", Style::default().fg(cat_subtext0())));
+                    spans.push(Span::styled(
+                        self.query.clone(),
+                        Style::default().fg(cat_yellow()),
+                    ));
+                    spans.push(Span::styled(
+                        format!(" ({current}/{total})"),
+                        Style::default().fg(cat_subtext0()),
+                    ));
+                }
+                spans.extend([
+                    Span::raw("  "),
+                    Span::styled(" n/p ", Style::default().fg(cat_mauve())),
+                    Span::raw("matches  "),
+                    Span::styled(" PgUp/PgDn ", Style::default().fg(cat_mauve())),
+                    Span::raw("scroll  "),
+                    Span::styled(" q ", Style::default().fg(cat_mauve())),
+                    Span::raw("quit"),
+                ]);
+                Line::from(spans)
+            }
+        }
+    }
 }
 
 fn tui_cards(records: &[FileRecord]) -> Vec<TuiCard> {
@@ -672,6 +905,7 @@ fn layout_tui_cards(cards: &[TuiCard], area: Rect, scroll: u16) -> Vec<TuiCardPo
                 index: card_index,
                 rect: Rect::new(x, area.y + visible_y, width, clipped_height),
                 full_y: y,
+                clipped_top,
                 visible,
             });
 
@@ -752,6 +986,182 @@ fn adjacent_card(
             horizontal_distance as u32 * 4 + vertical_distance as u32
         })
         .map(|position| position.index)
+}
+
+fn search_matches(cards: &[TuiCard], query: &str) -> Vec<SearchMatch> {
+    cards
+        .iter()
+        .enumerate()
+        .flat_map(|(card_index, card)| card_search_matches(card_index, card, query))
+        .collect()
+}
+
+fn card_search_matches(card_index: usize, card: &TuiCard, query: &str) -> Vec<SearchMatch> {
+    let mut matches = Vec::new();
+    matches.extend(
+        std::iter::repeat(SearchMatch {
+            card_index,
+            line_y: 0,
+        })
+        .take(match_ranges(&card_title_label(&card.title), query).len()),
+    );
+
+    for (line_index, line) in card.lines.iter().enumerate() {
+        let count = line_match_count(line, query);
+        matches.extend(
+            std::iter::repeat(SearchMatch {
+                card_index,
+                line_y: line_index.saturating_add(1).min(u16::MAX as usize) as u16,
+            })
+            .take(count),
+        );
+    }
+
+    matches
+}
+
+fn first_match_at_or_after_card(selected: usize, cards: &[TuiCard], query: &str) -> Option<usize> {
+    let matches = search_matches(cards, query);
+    matches
+        .iter()
+        .position(|search_match| search_match.card_index >= selected)
+        .or_else(|| (!matches.is_empty()).then_some(0))
+}
+
+fn count_matches_before(cards: &[TuiCard], card_index: usize, query: &str) -> usize {
+    cards
+        .iter()
+        .take(card_index)
+        .map(|card| card_match_count(card, query))
+        .sum()
+}
+
+fn card_match_count(card: &TuiCard, query: &str) -> usize {
+    match_ranges(&card_title_label(&card.title), query).len()
+        + card
+            .lines
+            .iter()
+            .map(|line| line_match_count(line, query))
+            .sum::<usize>()
+}
+
+fn line_match_count(line: &Line<'static>, query: &str) -> usize {
+    line.spans
+        .iter()
+        .map(|span| match_ranges(span.content.as_ref(), query).len())
+        .sum()
+}
+
+fn card_title_label(title: &str) -> String {
+    format!(" {title} ")
+}
+
+fn highlighted_title(
+    title: &str,
+    style: Style,
+    query: Option<&str>,
+    current_match: Option<usize>,
+    match_index: &mut usize,
+) -> Line<'static> {
+    Line::from(highlight_text(
+        &card_title_label(title),
+        style,
+        query,
+        current_match,
+        match_index,
+    ))
+}
+
+fn highlighted_lines(
+    lines: &[Line<'static>],
+    query: Option<&str>,
+    current_match: Option<usize>,
+    match_index: &mut usize,
+) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .map(|line| {
+            let spans = line
+                .spans
+                .iter()
+                .flat_map(|span| {
+                    highlight_text(
+                        span.content.as_ref(),
+                        span.style,
+                        query,
+                        current_match,
+                        match_index,
+                    )
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn highlight_text(
+    text: &str,
+    style: Style,
+    query: Option<&str>,
+    current_match: Option<usize>,
+    match_index: &mut usize,
+) -> Vec<Span<'static>> {
+    let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) else {
+        return vec![Span::styled(text.to_string(), style)];
+    };
+    let ranges = match_ranges(text, query);
+    if ranges.is_empty() {
+        return vec![Span::styled(text.to_string(), style)];
+    }
+
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end) in ranges {
+        if cursor < start {
+            spans.push(Span::styled(text[cursor..start].to_string(), style));
+        }
+        let highlight_style = if current_match == Some(*match_index) {
+            current_search_match_style()
+        } else {
+            search_match_style()
+        };
+        spans.push(Span::styled(text[start..end].to_string(), highlight_style));
+        *match_index += 1;
+        cursor = end;
+    }
+    if cursor < text.len() {
+        spans.push(Span::styled(text[cursor..].to_string(), style));
+    }
+    spans
+}
+
+fn match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let haystack = text.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    while let Some(start) = haystack[offset..].find(&needle) {
+        let start = offset + start;
+        let end = start + needle.len();
+        ranges.push((start, end));
+        offset = end;
+    }
+    ranges
+}
+
+fn search_match_style() -> Style {
+    Style::default().fg(Color::Black).bg(cat_light_yellow())
+}
+
+fn current_search_match_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(cat_dark_yellow())
+        .add_modifier(Modifier::BOLD)
 }
 
 fn render_output(
@@ -1098,6 +1508,14 @@ fn cat_peach() -> Color {
 
 fn cat_yellow() -> Color {
     Color::Rgb(249, 226, 175)
+}
+
+fn cat_light_yellow() -> Color {
+    Color::Rgb(255, 241, 199)
+}
+
+fn cat_dark_yellow() -> Color {
+    Color::Rgb(203, 151, 75)
 }
 
 fn cat_subtext0() -> Color {

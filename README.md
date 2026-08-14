@@ -22,6 +22,8 @@ TUI controls:
 * `l` / right: next card
 * `j` / down: nearest card below
 * `k` / up: nearest card above
+* `/`: search headings/files
+* `n` / `p`: next / previous search match
 * PgUp / PgDn: page scroll
 * Home / End: first / last card
 * `q` / Esc: quit
