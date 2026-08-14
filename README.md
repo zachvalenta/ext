@@ -3,12 +3,28 @@
 Extract heading-based outline trees from Markdown files.
 
 ```sh
-ext note.md                 # tree output by default
+ext note.md                 # TUI by default when stdout is a terminal
+ext notes/ --tree           # Catppuccin ANSI-styled boxed tree output
+ext notes/ --outline        # plain outline output
+ext notes/ --json           # JSON output
+ext notes/ --json --output=headings.json
+ext notes/ --style=never --tree
+
+# backwards-compatible form
+ext notes/ --format=tree
 ext notes/ --format=outline
-ext notes/ --format=json --output=headings.json
-ext notes/ --style=always   # force Catppuccin ANSI-styled boxed tree output
-ext notes/ --style=never    # plain tree output
+ext notes/ --format=json
 ```
+
+TUI controls:
+
+* `h` / left: previous card
+* `l` / right: next card
+* `j` / down: nearest card below
+* `k` / up: nearest card above
+* PgUp / PgDn: page scroll
+* Home / End: first / last card
+* `q` / Esc: quit
 
 # config
 

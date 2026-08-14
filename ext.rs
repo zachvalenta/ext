@@ -7,22 +7,48 @@ use std::{
     path::{Path, PathBuf},
     process,
     process::Command,
+    time::Duration,
 };
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
+use crossterm::{
+    event::{self, Event as TermEvent, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use pulldown_cmark::{Event, HeadingLevel, Parser as MdParser, Tag, TagEnd};
-use ratatui::style::Color;
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Parser)]
 #[command(about = "Extract heading-based outline trees from Markdown files.")]
+#[command(group(ArgGroup::new("output_mode").args(["tree", "outline", "json", "tui"]).multiple(false)))]
 struct Args {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
 
-    #[arg(long, value_enum, default_value_t = OutputFormat::Tree)]
-    format: OutputFormat,
+    #[arg(long, value_enum)]
+    format: Option<OutputFormat>,
+
+    #[arg(long)]
+    tree: bool,
+
+    #[arg(long)]
+    outline: bool,
+
+    #[arg(long)]
+    json: bool,
+
+    #[arg(long)]
+    tui: bool,
 
     #[arg(long)]
     output: Option<PathBuf>,
@@ -39,6 +65,7 @@ enum OutputFormat {
     Outline,
     Tree,
     Json,
+    Tui,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -106,8 +133,17 @@ fn run() -> Result<(), String> {
     }
 
     let records = file_records(&files, &config)?;
+    let format = selected_format(&args);
+
+    if format == OutputFormat::Tui {
+        if args.output.is_some() {
+            return Err("--output cannot be used with TUI output".to_string());
+        }
+        return run_tui(&records);
+    }
+
     let use_style = should_style(args.style, args.output.is_some());
-    let output = render_output(&records, args.format, use_style)?;
+    let output = render_output(&records, format, use_style)?;
 
     if let Some(output_path) = args.output {
         fs::write(output_path, output).map_err(|err| format!("Failed to write output: {err}"))?;
@@ -116,6 +152,29 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn selected_format(args: &Args) -> OutputFormat {
+    if args.tree {
+        return OutputFormat::Tree;
+    }
+    if args.outline {
+        return OutputFormat::Outline;
+    }
+    if args.json {
+        return OutputFormat::Json;
+    }
+    if args.tui {
+        return OutputFormat::Tui;
+    }
+    if let Some(format) = args.format {
+        return format;
+    }
+    if args.output.is_none() && io::stdout().is_terminal() {
+        OutputFormat::Tui
+    } else {
+        OutputFormat::Tree
+    }
 }
 
 fn load_config(config_path: Option<&Path>) -> Result<Config, String> {
@@ -373,6 +432,328 @@ fn filter_tree(
     filtered
 }
 
+fn run_tui(records: &[FileRecord]) -> Result<(), String> {
+    enable_raw_mode().map_err(|err| format!("Failed to enable raw mode: {err}"))?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)
+        .map_err(|err| format!("Failed to enter alternate screen: {err}"))?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal =
+        Terminal::new(backend).map_err(|err| format!("Failed to start TUI: {err}"))?;
+    let cards = tui_cards(records);
+    let mut selected = 0usize;
+    let mut scroll: u16 = 0;
+    let mut positions = Vec::new();
+    let mut result = Ok(());
+
+    loop {
+        let draw_result = terminal.draw(|frame| {
+            let area = frame.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+            let body = chunks[0];
+            let footer_area = chunks[1];
+            positions = layout_tui_cards(&cards, body, scroll);
+
+            if let Some(position) = positions.iter().find(|position| position.index == selected) {
+                if position.full_y < scroll {
+                    scroll = position.full_y;
+                    positions = layout_tui_cards(&cards, body, scroll);
+                } else {
+                    let bottom = position.full_y.saturating_add(position.rect.height);
+                    let visible_bottom = scroll.saturating_add(body.height);
+                    if bottom > visible_bottom {
+                        scroll = bottom.saturating_sub(body.height);
+                        positions = layout_tui_cards(&cards, body, scroll);
+                    }
+                }
+            }
+
+            for position in &positions {
+                if !position.visible || position.rect.height == 0 || position.rect.width == 0 {
+                    continue;
+                }
+                let card = &cards[position.index];
+                let is_selected = position.index == selected;
+                let border = if is_selected {
+                    cat_mauve()
+                } else {
+                    cat_surface2()
+                };
+                let title_style = Style::default()
+                    .fg(cat_rosewater())
+                    .add_modifier(Modifier::BOLD);
+                let block = Block::default()
+                    .title(Span::styled(format!(" {} ", card.title), title_style))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border));
+                let paragraph = Paragraph::new(card.lines.clone()).block(block);
+                frame.render_widget(paragraph, position.rect);
+            }
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " NORMAL ",
+                    Style::default()
+                        .fg(cat_mauve())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" h/j/k/l cards  "),
+                Span::styled(" PgUp/PgDn ", Style::default().fg(cat_mauve())),
+                Span::raw("scroll  "),
+                Span::styled(" q ", Style::default().fg(cat_mauve())),
+                Span::raw("quit  "),
+                Span::styled(
+                    " --tree --json --outline ",
+                    Style::default().fg(cat_subtext0()),
+                ),
+                Span::raw("CLI"),
+            ]));
+            frame.render_widget(footer, footer_area);
+        });
+
+        if let Err(err) = draw_result {
+            result = Err(format!("Failed to draw TUI: {err}"));
+            break;
+        }
+
+        if event::poll(Duration::from_millis(100))
+            .map_err(|err| format!("Failed to poll terminal events: {err}"))?
+        {
+            match event::read().map_err(|err| format!("Failed to read terminal event: {err}"))? {
+                TermEvent::Key(key) => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('h') | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        selected = (selected + 1).min(cards.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        selected = adjacent_card(selected, &positions, DirectionHint::Down)
+                            .unwrap_or_else(|| (selected + 1).min(cards.len().saturating_sub(1)));
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        selected = adjacent_card(selected, &positions, DirectionHint::Up)
+                            .unwrap_or_else(|| selected.saturating_sub(1));
+                    }
+                    KeyCode::PageDown => scroll = scroll.saturating_add(10),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::Home => selected = 0,
+                    KeyCode::End => selected = cards.len().saturating_sub(1),
+                    _ => {}
+                },
+                TermEvent::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+    }
+
+    disable_raw_mode().map_err(|err| format!("Failed to disable raw mode: {err}"))?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .map_err(|err| format!("Failed to leave alternate screen: {err}"))?;
+    terminal
+        .show_cursor()
+        .map_err(|err| format!("Failed to show cursor: {err}"))?;
+
+    result
+}
+
+#[derive(Clone)]
+struct TuiCard {
+    title: String,
+    width: u16,
+    height: u16,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Clone)]
+struct TuiCardPosition {
+    index: usize,
+    rect: Rect,
+    full_y: u16,
+    visible: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DirectionHint {
+    Up,
+    Down,
+}
+
+fn tui_cards(records: &[FileRecord]) -> Vec<TuiCard> {
+    records
+        .iter()
+        .map(|record| {
+            let mut lines = Vec::new();
+            let mut plain_lines = Vec::new();
+            tui_node_lines(&record.headings, "", &mut lines, &mut plain_lines);
+            let title = file_name(record).to_uppercase();
+            let content_width = plain_lines
+                .iter()
+                .map(|line| display_width(line))
+                .chain([display_width(&title)])
+                .max()
+                .unwrap_or(0);
+            let width = ((content_width + 4).max(28).min(64)) as u16;
+            let height = (lines.len() + 2).min(u16::MAX as usize) as u16;
+            TuiCard {
+                title,
+                width,
+                height,
+                lines,
+            }
+        })
+        .collect()
+}
+
+fn tui_node_lines(
+    nodes: &[Node],
+    prefix: &str,
+    lines: &mut Vec<Line<'static>>,
+    plain_lines: &mut Vec<String>,
+) {
+    for (i, node) in nodes.iter().enumerate() {
+        let is_last = i == nodes.len() - 1;
+        let branch = if is_last { "└── " } else { "├── " };
+        let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+        let plain = format!("{prefix}{branch}{}", node.text);
+        plain_lines.push(plain);
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(cat_surface2())),
+            Span::styled(branch, Style::default().fg(cat_surface2())),
+            Span::styled(
+                node.text.clone(),
+                Style::default().fg(color_for_level(node.level)),
+            ),
+        ]));
+        tui_node_lines(&node.children, &child_prefix, lines, plain_lines);
+    }
+}
+
+fn layout_tui_cards(cards: &[TuiCard], area: Rect, scroll: u16) -> Vec<TuiCardPosition> {
+    if cards.is_empty() || area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+
+    let gap = 1u16;
+    let columns = tui_columns(cards, area.width as usize, gap as usize);
+    let column_widths = columns
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .map(|&index| cards[index].width)
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let mut positions = Vec::new();
+    let mut x = area.x;
+
+    for (column_index, column) in columns.iter().enumerate() {
+        let mut y = 0u16;
+        let width =
+            column_widths[column_index].min(area.width.saturating_sub(x.saturating_sub(area.x)));
+
+        for &card_index in column {
+            let card = &cards[card_index];
+            let height = card.height;
+            let card_bottom = y.saturating_add(height);
+            let visible = card_bottom > scroll && y < scroll.saturating_add(area.height);
+            let clipped_top = scroll.saturating_sub(y).min(height);
+            let visible_y = y.saturating_sub(scroll);
+            let clipped_height = height
+                .saturating_sub(clipped_top)
+                .min(area.height.saturating_sub(visible_y));
+
+            positions.push(TuiCardPosition {
+                index: card_index,
+                rect: Rect::new(x, area.y + visible_y, width, clipped_height),
+                full_y: y,
+                visible,
+            });
+
+            y = y.saturating_add(height).saturating_add(1);
+        }
+
+        x = x.saturating_add(width).saturating_add(gap);
+    }
+
+    positions
+}
+
+fn tui_columns(cards: &[TuiCard], viewport_width: usize, gap: usize) -> Vec<Vec<usize>> {
+    let max_columns = max_styled_columns(viewport_width).min(cards.len());
+
+    for column_count in (1..=max_columns).rev() {
+        let columns = distribute_tui_cards(cards, column_count);
+        let width = columns
+            .iter()
+            .map(|column| {
+                column
+                    .iter()
+                    .map(|&index| cards[index].width as usize)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum::<usize>()
+            + gap * columns.len().saturating_sub(1);
+        if width <= viewport_width || column_count == 1 {
+            return columns;
+        }
+    }
+
+    distribute_tui_cards(cards, 1)
+}
+
+fn distribute_tui_cards(cards: &[TuiCard], column_count: usize) -> Vec<Vec<usize>> {
+    let mut columns = vec![Vec::new(); column_count];
+    let mut heights = vec![0u16; column_count];
+
+    for (index, card) in cards.iter().enumerate() {
+        let column_index = heights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, height)| *height)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        if heights[column_index] > 0 {
+            heights[column_index] = heights[column_index].saturating_add(1);
+        }
+        heights[column_index] = heights[column_index].saturating_add(card.height);
+        columns[column_index].push(index);
+    }
+
+    columns
+}
+
+fn adjacent_card(
+    selected: usize,
+    positions: &[TuiCardPosition],
+    direction: DirectionHint,
+) -> Option<usize> {
+    let current = positions
+        .iter()
+        .find(|position| position.index == selected)?;
+    let current_center = current.rect.x.saturating_add(current.rect.width / 2);
+
+    positions
+        .iter()
+        .filter(|position| match direction {
+            DirectionHint::Down => position.full_y > current.full_y,
+            DirectionHint::Up => position.full_y < current.full_y,
+        })
+        .min_by_key(|position| {
+            let center = position.rect.x.saturating_add(position.rect.width / 2);
+            let horizontal_distance = center.abs_diff(current_center);
+            let vertical_distance = position.full_y.abs_diff(current.full_y);
+            horizontal_distance as u32 * 4 + vertical_distance as u32
+        })
+        .map(|position| position.index)
+}
+
 fn render_output(
     records: &[FileRecord],
     format: OutputFormat,
@@ -383,6 +764,7 @@ fn render_output(
             .map_err(|err| format!("Failed to render JSON: {err}")),
         OutputFormat::Tree => Ok(render_tree(records, use_style)),
         OutputFormat::Outline => Ok(render_outline(records)),
+        OutputFormat::Tui => Err("TUI output cannot be rendered as text".to_string()),
     }
 }
 
@@ -449,55 +831,138 @@ fn render_plain_tree_nodes(nodes: &[Node], prefix: &str, lines: &mut Vec<String>
 }
 
 fn render_styled_tree(records: &[FileRecord]) -> String {
-    let viewport_width = terminal_width().unwrap_or(100) as usize;
-    let gap = 2;
+    let viewport_width = terminal_width().unwrap_or(100).saturating_sub(2) as usize;
+    let gap = 3;
     let blocks = records.iter().map(styled_block).collect::<Vec<_>>();
+
+    if blocks.is_empty() {
+        return String::new();
+    }
+
+    let columns = masonry_columns(&blocks, viewport_width, gap);
+    let column_widths = columns
+        .iter()
+        .map(|column| column.iter().map(|block| block.width).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let column_lines = columns
+        .iter()
+        .zip(column_widths.iter())
+        .map(|(column, width)| render_masonry_column(column, *width))
+        .collect::<Vec<_>>();
+    let height = column_lines
+        .iter()
+        .map(|lines| lines.len())
+        .max()
+        .unwrap_or(0);
     let mut output = Vec::new();
-    let mut index = 0;
 
-    while index < blocks.len() {
-        let mut row_width = 0;
-        let mut row = Vec::new();
-
-        while index < blocks.len() {
-            let block = &blocks[index];
-            let next_width = if row.is_empty() {
-                block.width
-            } else {
-                row_width + gap + block.width
-            };
-
-            if !row.is_empty() && next_width > viewport_width {
-                break;
+    for line_index in 0..height {
+        let mut line = String::new();
+        for (column_index, lines) in column_lines.iter().enumerate() {
+            if column_index > 0 {
+                line.push_str(&" ".repeat(gap));
             }
 
-            row_width = next_width;
-            row.push(block);
-            index += 1;
-        }
-
-        if !output.is_empty() {
-            output.push(String::new());
-        }
-
-        let row_height = row.iter().map(|block| block.lines.len()).max().unwrap_or(0);
-        for line_index in 0..row_height {
-            let mut line = String::new();
-            for (block_index, block) in row.iter().enumerate() {
-                if block_index > 0 {
-                    line.push_str(&" ".repeat(gap));
-                }
-                if let Some(block_line) = block.lines.get(line_index) {
-                    line.push_str(block_line);
-                } else {
-                    line.push_str(&" ".repeat(block.width));
-                }
+            if let Some(column_line) = lines.get(line_index) {
+                line.push_str(column_line);
+            } else if later_columns_have_content(&column_lines, column_index, line_index) {
+                line.push_str(&" ".repeat(column_widths[column_index]));
             }
-            output.push(line);
         }
+        output.push(line.trim_end().to_string());
     }
 
     output.join("\n")
+}
+
+fn masonry_columns<'a>(
+    blocks: &'a [StyledBlock],
+    viewport_width: usize,
+    gap: usize,
+) -> Vec<Vec<&'a StyledBlock>> {
+    let max_columns = max_styled_columns(viewport_width).min(blocks.len());
+
+    for column_count in (1..=max_columns).rev() {
+        let columns = distribute_blocks(blocks, column_count);
+        let total_width = masonry_width(&columns, gap);
+        if total_width <= viewport_width || column_count == 1 {
+            return columns;
+        }
+    }
+
+    distribute_blocks(blocks, 1)
+}
+
+fn distribute_blocks<'a>(
+    blocks: &'a [StyledBlock],
+    column_count: usize,
+) -> Vec<Vec<&'a StyledBlock>> {
+    let mut columns = vec![Vec::new(); column_count];
+    let mut heights = vec![0; column_count];
+
+    for block in blocks {
+        let column_index = heights
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, height)| *height)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+
+        if heights[column_index] > 0 {
+            heights[column_index] += 1;
+        }
+        heights[column_index] += block.lines.len();
+        columns[column_index].push(block);
+    }
+
+    columns
+}
+
+fn masonry_width(columns: &[Vec<&StyledBlock>], gap: usize) -> usize {
+    columns
+        .iter()
+        .map(|column| column.iter().map(|block| block.width).max().unwrap_or(0))
+        .sum::<usize>()
+        + gap * columns.len().saturating_sub(1)
+}
+
+fn render_masonry_column(blocks: &[&StyledBlock], width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for (block_index, block) in blocks.iter().enumerate() {
+        if block_index > 0 {
+            lines.push(" ".repeat(width));
+        }
+
+        for line in &block.lines {
+            lines.push(format!(
+                "{}{}",
+                line,
+                " ".repeat(width.saturating_sub(block.width))
+            ));
+        }
+    }
+
+    lines
+}
+
+fn later_columns_have_content(
+    column_lines: &[Vec<String>],
+    column_index: usize,
+    line_index: usize,
+) -> bool {
+    column_lines
+        .iter()
+        .skip(column_index + 1)
+        .any(|lines| line_index < lines.len())
+}
+
+fn max_styled_columns(viewport_width: usize) -> usize {
+    match viewport_width {
+        0..=89 => 1,
+        90..=159 => 2,
+        _ => 3,
+    }
 }
 
 struct StyledBlock {
@@ -517,7 +982,7 @@ fn styled_block(record: &FileRecord) -> StyledBlock {
         .chain([display_width(&file_label_plain(&name))])
         .max()
         .unwrap_or(0);
-    let width = (max_content_width + 2).max(min_width);
+    let width = (max_content_width + 3).max(min_width);
     let inner_width = width.saturating_sub(2);
 
     let mut lines = Vec::new();
@@ -665,7 +1130,20 @@ fn terminal_width() -> Option<u16> {
 }
 
 fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    // Terminals disagree on some emoji ZWJ / VS16 / keycap clusters. unicode-width
+    // gives us the baseline, then we add a small correction for the keycap emoji
+    // sequences that show up often in these notes, e.g. `1️⃣`, `2️⃣`.
+    UnicodeWidthStr::width(text) + keycap_width_correction(text)
+}
+
+fn keycap_width_correction(text: &str) -> usize {
+    let chars = text.chars().collect::<Vec<_>>();
+    chars
+        .windows(3)
+        .filter(|window| {
+            window[0].is_ascii_digit() && window[1] == '\u{fe0f}' && window[2] == '\u{20e3}'
+        })
+        .count()
 }
 
 fn should_style(style: StyleMode, writing_to_file: bool) -> bool {
