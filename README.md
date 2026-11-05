@@ -7,13 +7,16 @@ ext note.md                 # TUI by default when stdout is a terminal
 ext notes/ --tree           # Catppuccin ANSI-styled boxed tree output
 ext notes/ --outline        # plain outline output
 ext notes/ --json           # JSON output
+ext notes/ --yaml           # concise YAML output
 ext notes/ --json --output=headings.json
+ext notes/ --yaml --output=headings.yaml
 ext notes/ --style=never --tree
 
 # backwards-compatible form
 ext notes/ --format=tree
 ext notes/ --format=outline
 ext notes/ --format=json
+ext notes/ --format=yaml
 ```
 
 TUI controls:

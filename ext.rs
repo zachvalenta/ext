@@ -30,7 +30,7 @@ use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Parser)]
 #[command(about = "Extract heading-based outline trees from Markdown files.")]
-#[command(group(ArgGroup::new("output_mode").args(["tree", "outline", "json", "tui"]).multiple(false)))]
+#[command(group(ArgGroup::new("output_mode").args(["tree", "outline", "json", "yaml", "tui"]).multiple(false)))]
 struct Args {
     #[arg(required = true)]
     paths: Vec<PathBuf>,
@@ -46,6 +46,9 @@ struct Args {
 
     #[arg(long)]
     json: bool,
+
+    #[arg(long)]
+    yaml: bool,
 
     #[arg(long)]
     tui: bool,
@@ -65,6 +68,7 @@ enum OutputFormat {
     Outline,
     Tree,
     Json,
+    Yaml,
     Tui,
 }
 
@@ -163,6 +167,9 @@ fn selected_format(args: &Args) -> OutputFormat {
     }
     if args.json {
         return OutputFormat::Json;
+    }
+    if args.yaml {
+        return OutputFormat::Yaml;
     }
     if args.tui {
         return OutputFormat::Tui;
@@ -1172,10 +1179,45 @@ fn render_output(
     match format {
         OutputFormat::Json => serde_json::to_string_pretty(records)
             .map_err(|err| format!("Failed to render JSON: {err}")),
+        OutputFormat::Yaml => render_yaml(records),
         OutputFormat::Tree => Ok(render_tree(records, use_style)),
         OutputFormat::Outline => Ok(render_outline(records)),
         OutputFormat::Tui => Err("TUI output cannot be rendered as text".to_string()),
     }
+}
+
+fn render_yaml(records: &[FileRecord]) -> Result<String, String> {
+    let mut lines = Vec::new();
+
+    for record in records {
+        lines.push(format!("- path: {}", yaml_string(&record.path)?));
+        lines.push("  children:".to_string());
+        render_yaml_nodes(&record.headings, 4, &mut lines)?;
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn render_yaml_nodes(nodes: &[Node], indent: usize, lines: &mut Vec<String>) -> Result<(), String> {
+    for node in nodes {
+        lines.push(format!(
+            "{}- header: {}",
+            " ".repeat(indent),
+            yaml_string(&node.text)?
+        ));
+        if !node.children.is_empty() {
+            lines.push(format!("{}  children:", " ".repeat(indent)));
+            render_yaml_nodes(&node.children, indent + 4, lines)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn yaml_string(text: &str) -> Result<String, String> {
+    // JSON double-quoted strings are valid YAML scalars. This keeps headings with
+    // YAML-significant characters (for example `:`, `#`, or `---`) unambiguous.
+    serde_json::to_string(text).map_err(|err| format!("Failed to render YAML: {err}"))
 }
 
 fn render_outline(records: &[FileRecord]) -> String {
